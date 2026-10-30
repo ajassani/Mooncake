@@ -687,9 +687,28 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return 0;
         }
 
+        // Resolve the true hipMalloc base address. Framework caching
+        // allocators (PyTorch, etc.) sub-allocate tensors within larger
+        // hipMalloc segments. hipIpcGetMemHandle always returns a handle for
+        // the entire segment and hipIpcOpenMemHandle maps it at the segment
+        // base, so we must register at segment granularity for correct IPC
+        // relocation.
+        hipDeviceptr_t base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (!checkHip(hipMemGetAddressRange(&base_ptr, &alloc_size,
+                                            (hipDeviceptr_t)addr),
+                      "HipTransport: hipMemGetAddressRange failed")) {
+            return -1;
+        }
+
+        // Skip if this hipMalloc block is already registered
+        if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+            return 0;
+        }
+
         // Get IPC handle
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, addr),
+        if (!checkHip(hipIpcGetMemHandle(&handle, (void*)base_ptr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
             return -1;
         }
@@ -697,14 +716,18 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         // Register buffer with metadata
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_addrs_.insert((uint64_t)base_ptr);
+        }
+        return rc;
     }
 
     // Fabric memory registration
@@ -754,7 +777,28 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    if (use_fabric_mem_) {
+        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    }
+
+    hipDeviceptr_t base_ptr = nullptr;
+    size_t alloc_size = 0;
+    void* key_ptr = addr;
+    if (hipMemGetAddressRange(&base_ptr, &alloc_size, (hipDeviceptr_t)addr) ==
+        hipSuccess) {
+        key_ptr = (void*)base_ptr;
+    } else {
+        (void)hipGetLastError();
+        LOG(WARNING) << "HipTransport: hipMemGetAddressRange failed for addr "
+                     << addr << " during unregister. Memory may already be "
+                     << "freed, using provided address.";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        registered_base_addrs_.erase((uint64_t)key_ptr);
+    }
+    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
