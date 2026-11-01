@@ -702,7 +702,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         }
 
         // Skip if this hipMalloc block is already registered
-        if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+        auto refcnt_it = registered_base_refcnt_.find((uint64_t)base_ptr);
+        if (refcnt_it != registered_base_refcnt_.end()) {
+            ++refcnt_it->second;
             return 0;
         }
 
@@ -725,7 +727,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 #endif
         int rc = metadata_->addLocalMemoryBuffer(desc, true);
         if (rc == 0) {
-            registered_base_addrs_.insert((uint64_t)base_ptr);
+            registered_base_refcnt_[(uint64_t)base_ptr] = 1;
         }
         return rc;
     }
@@ -794,9 +796,13 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
                      << "freed, using provided address.";
     }
 
-    {
-        std::lock_guard<std::mutex> lock(register_mutex_);
-        registered_base_addrs_.erase((uint64_t)key_ptr);
+    // The segment stays registered until the last buffer inside it is
+    // unregistered.
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto refcnt_it = registered_base_refcnt_.find((uint64_t)key_ptr);
+    if (refcnt_it != registered_base_refcnt_.end()) {
+        if (--refcnt_it->second > 0) return 0;
+        registered_base_refcnt_.erase(refcnt_it);
     }
     return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
 }
