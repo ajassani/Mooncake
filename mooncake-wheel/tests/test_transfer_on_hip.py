@@ -1,3 +1,4 @@
+import multiprocessing
 import socket
 import unittest
 
@@ -11,6 +12,52 @@ def get_ip() -> str:
             return s.getsockname()[0]
     except Exception:
         return socket.gethostbyname(socket.gethostname())
+
+
+SUBALLOC_HOLDER_BYTES = 4 * 1024 * 1024
+SUBALLOC_OFFSETS = (1024 * 1024 + 4096, 3 * 1024 * 1024)
+
+
+def _suballoc_receiver(conn, nbytes):
+    """Peer process for the HIP IPC sub-allocation test.
+
+    Registers two views at nonzero offsets inside one hipMalloc segment, waits
+    for the writer, and reports what landed where.
+    """
+    from mooncake.engine import TransferEngine
+
+    try:
+        engine = TransferEngine()
+        hostname = get_ip()
+        if engine.initialize(hostname, "P2PHANDSHAKE", "hip", "") != 0:
+            conn.send(None)
+            return
+        if ":" in hostname:
+            target_name = f"[{hostname}]:{engine.get_rpc_port()}"
+        else:
+            target_name = f"{hostname}:{engine.get_rpc_port()}"
+
+        holder = torch.zeros(SUBALLOC_HOLDER_BYTES, dtype=torch.uint8,
+                             device="cuda:0")
+        views = [holder[off:off + nbytes] for off in SUBALLOC_OFFSETS]
+        register_rc = [engine.register_memory(v.data_ptr(), nbytes)
+                       for v in views]
+        conn.send((target_name, [v.data_ptr() for v in views], register_rc))
+
+        conn.recv()
+        torch.cuda.synchronize()
+        expected = torch.zeros_like(holder)
+        for i, off in enumerate(SUBALLOC_OFFSETS):
+            expected[off:off + nbytes] = i + 1
+        mismatched = int((holder != expected).sum().item())
+        unregister_rc = [engine.unregister_memory(v.data_ptr()) for v in views]
+        reregister_rc = [engine.register_memory(v.data_ptr(), nbytes)
+                         for v in views]
+        for v in views:
+            engine.unregister_memory(v.data_ptr())
+        conn.send((mismatched, unregister_rc, reregister_rc))
+    except Exception as e:
+        conn.send(repr(e))
 
 
 class TestTransferOnHip(unittest.TestCase):
@@ -80,6 +127,46 @@ class TestTransferOnHip(unittest.TestCase):
         self.assertEqual(ret, 0)
         torch.cuda.synchronize()
         self.assertTrue(torch.all(self.src_tensor == 77))
+
+    def test_ipc_write_into_suballocation(self):
+        # Caching allocators hand out tensors inside larger hipMalloc
+        # segments, and a HIP IPC handle always maps the whole segment, so a
+        # write to a buffer at a nonzero offset must land at that offset in
+        # the peer process.
+        nbytes = 256 * 1024
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        peer = ctx.Process(target=_suballoc_receiver, args=(child_conn, nbytes))
+        peer.start()
+        try:
+            self.assertTrue(parent_conn.poll(60), "peer did not start")
+            info = parent_conn.recv()
+            if info is None:
+                self.skipTest("peer failed to initialize HIP transport")
+            self.assertIsInstance(info, tuple, info)
+            target_name, dst_ptrs, register_rc = info
+            self.assertEqual(register_rc, [0, 0])
+
+            for i, dst_ptr in enumerate(dst_ptrs):
+                self.src_tensor[:nbytes].fill_(i + 1)
+                torch.cuda.synchronize()
+                ret = self.engine.transfer_sync_write(
+                    target_name, self.src_tensor.data_ptr(), dst_ptr, nbytes
+                )
+                self.assertEqual(ret, 0)
+            parent_conn.send("written")
+
+            self.assertTrue(parent_conn.poll(60), "peer did not report")
+            result = parent_conn.recv()
+            self.assertIsInstance(result, tuple, result)
+            mismatched, unregister_rc, reregister_rc = result
+            self.assertEqual(mismatched, 0)
+            self.assertEqual(unregister_rc, [0, 0])
+            self.assertEqual(reregister_rc, [0, 0])
+        finally:
+            peer.join(timeout=30)
+            if peer.is_alive():
+                peer.terminate()
 
 
 if __name__ == "__main__":
